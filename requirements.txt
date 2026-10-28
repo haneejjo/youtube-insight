@@ -6,3 +6,4 @@ wordcloud
 openpyxl
 transformers
 torch
+koreanize-matplotlib
