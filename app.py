@@ -1,7 +1,6 @@
 
 import os
 import re
-import glob
 import tempfile
 from io import BytesIO
 
@@ -9,6 +8,7 @@ import pandas as pd
 import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
 
 st.set_page_config(
     page_title="YouTube Insight",
@@ -79,69 +79,13 @@ def download_buttons(df, filename):
 
 
 # -------------------------
-# 유튜브 영상 음성 추출
-# 자막을 사용하지 않습니다.
-# -------------------------
-
-def download_video_audio(video_id, output_dir):
-    import yt_dlp
-
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
-
-    options = {
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(output_dir, "%(id)s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 2,
-        "socket_timeout": 30,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "64"
-            }
-        ]
-    }
-
-    with yt_dlp.YoutubeDL(options) as downloader:
-        downloader.download([video_url])
-
-    audio_path = os.path.join(output_dir, f"{video_id}.mp3")
-
-    if os.path.isfile(audio_path):
-        return audio_path
-
-    # 파일 확장자가 예상과 다른 경우에도 찾아봅니다.
-    candidates = glob.glob(
-        os.path.join(output_dir, f"{video_id}.*")
-    )
-
-    candidates = [
-        path for path in candidates
-        if os.path.isfile(path)
-        and not path.endswith((".part", ".ytdl"))
-    ]
-
-    if not candidates:
-        raise RuntimeError(
-            "음성 파일을 찾을 수 없습니다. "
-            "유튜브 영상 접근이 제한되었을 수 있습니다."
-        )
-
-    return candidates[0]
-
-
-# -------------------------
-# Whisper 음성 인식 모델
+# 업로드한 음성 파일 처리
 # -------------------------
 
 @st.cache_resource
 def load_whisper_model():
     from faster_whisper import WhisperModel
 
-    # 무료 서버의 메모리 부담을 줄이기 위해 base 모델을 사용합니다.
     return WhisperModel(
         "base",
         device="cpu",
@@ -171,16 +115,14 @@ def transcribe_audio(audio_path):
     if not transcript_text:
         raise ValueError(
             "음성을 텍스트로 변환하지 못했습니다. "
-            "영상에 음성이 있는지 확인해 주세요."
+            "파일에 음성이 있는지 확인해 주세요."
         )
 
-    detected_language = getattr(info, "language", "알 수 없음")
-
-    return transcript_text, detected_language
+    return transcript_text, getattr(info, "language", "알 수 없음")
 
 
 # -------------------------
-# 한국어 영상 요약 모델
+# 한국어 요약 모델
 # -------------------------
 
 @st.cache_resource
@@ -350,6 +292,21 @@ video_url = st.text_input(
     placeholder="https://www.youtube.com/watch?v=..."
 )
 
+st.subheader("영상 요약용 음성 파일")
+st.write(
+    "유튜브에서 음성을 자동으로 내려받지 않습니다. "
+    "분석할 영상의 음성 파일을 직접 업로드해 주세요."
+)
+
+audio_file = st.file_uploader(
+    "음성 파일 업로드",
+    type=["mp3", "wav", "m4a", "aac", "flac", "ogg", "wma", "mp4", "webm"],
+    help="음성이 포함된 파일을 업로드하세요. 긴 파일은 처리 시간이 더 걸릴 수 있습니다."
+)
+
+if audio_file:
+    st.success(f"업로드 완료: {audio_file.name}")
+
 st.subheader("분석할 기능")
 
 left, right = st.columns(2)
@@ -424,8 +381,7 @@ if st.button("전체 분석 시작", type="primary"):
             st.subheader(snippet.get("title", "제목 없음"))
             st.write(f"채널: {snippet.get('channelTitle', '')}")
             st.write(
-                f"업로드 날짜: "
-                f"{snippet.get('publishedAt', '')[:10]}"
+                f"업로드 날짜: {snippet.get('publishedAt', '')[:10]}"
             )
 
             c1, c2, c3 = st.columns(3)
@@ -434,93 +390,102 @@ if st.button("전체 분석 시작", type="primary"):
                 "조회수",
                 f"{safe_int(statistics.get('viewCount')):,}"
             )
-
             c2.metric(
                 "좋아요",
                 f"{safe_int(statistics.get('likeCount')):,}"
             )
-
             c3.metric(
                 "댓글 수",
                 f"{safe_int(statistics.get('commentCount')):,}"
             )
 
-        # 2. 음성 기반 영상 핵심 요약
+        # 2. 음성 파일 기반 영상 요약
         if video_summary:
             st.header("2. 영상 핵심 요약")
 
-            try:
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    with st.spinner(
-                        "1/3 영상에서 음성을 추출하고 있습니다..."
-                    ):
-                        audio_path = download_video_audio(
-                            video_id,
-                            temp_dir
-                        )
-
-                    with st.spinner(
-                        "2/3 AI가 음성을 텍스트로 변환하고 있습니다. "
-                        "영상 길이에 따라 시간이 걸릴 수 있습니다."
-                    ):
-                        transcript_text, detected_language = (
-                            transcribe_audio(audio_path)
-                        )
-
-                    with st.spinner(
-                        "3/3 AI가 영상의 핵심 내용을 요약하고 있습니다..."
-                    ):
-                        tokenizer, summary_model = load_summary_model()
-
-                        summary_text = summarize_transcript(
-                            transcript_text,
-                            tokenizer,
-                            summary_model
-                        )
-
-                if summary_text:
-                    st.subheader("핵심 요약")
-                    st.write(summary_text)
-
-                    st.caption(
-                        f"음성 인식 언어: {detected_language}"
-                    )
-
-                    st.info(
-                        "영상의 음성을 텍스트로 변환한 뒤 요약했습니다. "
-                        "화면에만 표시되는 글자나 음성으로 설명되지 않는 "
-                        "장면은 요약에 포함되지 않을 수 있습니다."
-                    )
-
-                    with st.expander("음성 인식 결과 확인"):
-                        st.write(transcript_text)
-
-                    if export_results:
-                        summary_df = pd.DataFrame([{
-                            "영상 제목": snippet.get("title", ""),
-                            "영상 링크": video_url.strip(),
-                            "음성 인식 언어": detected_language,
-                            "음성 인식 내용": transcript_text,
-                            "핵심 요약": summary_text
-                        }])
-
-                        download_buttons(
-                            summary_df,
-                            "youtube_video_summary"
-                        )
-
-                else:
-                    st.warning("요약 결과가 비어 있습니다.")
-
-            except Exception as e:
-                st.error(
-                    "음성 기반 영상 요약에 실패했습니다."
+            if audio_file is None:
+                st.warning(
+                    "영상 요약을 하려면 위에서 음성 파일을 업로드해 주세요. "
+                    "음성 파일 없이도 다른 분석 기능은 사용할 수 있습니다."
                 )
-                st.write(
-                    "영상 음성 추출, 음성 인식 또는 요약 모델 "
-                    "처리 중 문제가 발생했을 수 있습니다."
-                )
-                st.code(str(e))
+
+            else:
+                try:
+                    # 파일 확장자를 유지해 ffmpeg가 파일 형식을 인식하게 합니다.
+                    suffix = os.path.splitext(audio_file.name)[1].lower()
+
+                    if not suffix:
+                        suffix = ".audio"
+
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        audio_path = os.path.join(
+                            temp_dir,
+                            "uploaded_audio" + suffix
+                        )
+
+                        with open(audio_path, "wb") as file:
+                            file.write(audio_file.getvalue())
+
+                        with st.spinner(
+                            "1/2 AI가 음성을 텍스트로 변환하고 있습니다. "
+                            "처음에는 모델 다운로드 때문에 오래 걸릴 수 있습니다."
+                        ):
+                            transcript_text, detected_language = (
+                                transcribe_audio(audio_path)
+                            )
+
+                        with st.spinner(
+                            "2/2 AI가 핵심 내용을 요약하고 있습니다..."
+                        ):
+                            tokenizer, summary_model = load_summary_model()
+
+                            summary_text = summarize_transcript(
+                                transcript_text,
+                                tokenizer,
+                                summary_model
+                            )
+
+                    if summary_text:
+                        st.subheader("핵심 요약")
+                        st.write(summary_text)
+
+                        st.caption(
+                            f"음성 인식 언어: {detected_language}"
+                        )
+
+                        st.info(
+                            "업로드한 파일의 음성을 바탕으로 요약했습니다. "
+                            "화면에만 표시되는 글자나 음성으로 설명되지 않는 "
+                            "장면은 포함되지 않을 수 있습니다."
+                        )
+
+                        with st.expander("음성 인식 결과 확인"):
+                            st.write(transcript_text)
+
+                        if export_results:
+                            summary_df = pd.DataFrame([{
+                                "영상 제목": snippet.get("title", ""),
+                                "영상 링크": video_url.strip(),
+                                "음성 인식 언어": detected_language,
+                                "음성 인식 내용": transcript_text,
+                                "핵심 요약": summary_text
+                            }])
+
+                            download_buttons(
+                                summary_df,
+                                "youtube_video_summary"
+                            )
+
+                    else:
+                        st.warning("요약 결과가 비어 있습니다.")
+
+                except Exception as e:
+                    st.error("음성 파일 분석에 실패했습니다.")
+                    st.write(
+                        "지원하지 않는 파일이거나 음성 인식 또는 "
+                        "요약 모델 처리 중 문제가 발생했을 수 있습니다."
+                    )
+                    st.code(str(e))
 
         # 3. 댓글 수집
         comments = []
@@ -536,10 +501,7 @@ if st.button("전체 분석 시작", type="primary"):
                         result = youtube.commentThreads().list(
                             part="snippet",
                             videoId=video_id,
-                            maxResults=min(
-                                100,
-                                300 - len(comments)
-                            ),
+                            maxResults=min(100, 300 - len(comments)),
                             pageToken=next_page_token,
                             textFormat="plainText"
                         ).execute()
@@ -559,9 +521,7 @@ if st.button("전체 분석 시작", type="primary"):
                         if not next_page_token:
                             break
 
-                st.success(
-                    f"댓글 {len(comments)}개를 수집했습니다."
-                )
+                st.success(f"댓글 {len(comments)}개를 수집했습니다.")
 
             except HttpError as e:
                 st.warning(
@@ -573,10 +533,7 @@ if st.button("전체 분석 시작", type="primary"):
         comments_df = pd.DataFrame({"댓글": comments})
 
         if comments and export_results:
-            download_buttons(
-                comments_df,
-                "youtube_comments"
-            )
+            download_buttons(comments_df, "youtube_comments")
 
         # 4. 댓글 감정 분석
         if comment_analysis and comments:
@@ -590,14 +547,8 @@ if st.button("전체 분석 시작", type="primary"):
                 status = st.empty()
                 batch_size = 8
 
-                with st.spinner(
-                    "AI가 댓글 감정을 분석하고 있습니다..."
-                ):
-                    for start in range(
-                        0,
-                        len(comments),
-                        batch_size
-                    ):
+                with st.spinner("AI가 댓글 감정을 분석하고 있습니다..."):
+                    for start in range(0, len(comments), batch_size):
                         batch = comments[start:start + batch_size]
 
                         predictions = model(
@@ -606,10 +557,7 @@ if st.button("전체 분석 시작", type="primary"):
                             max_length=256
                         )
 
-                        for comment, prediction in zip(
-                            batch,
-                            predictions
-                        ):
+                        for comment, prediction in zip(batch, predictions):
                             sentiment, emotion, score = (
                                 classify_sentiment(prediction)
                             )
@@ -621,15 +569,8 @@ if st.button("전체 분석 시작", type="primary"):
                                 "점수": round(score, 4)
                             })
 
-                        completed = min(
-                            start + batch_size,
-                            len(comments)
-                        )
-
-                        progress.progress(
-                            completed / len(comments)
-                        )
-
+                        completed = min(start + batch_size, len(comments))
+                        progress.progress(completed / len(comments))
                         status.write(
                             f"{completed}/{len(comments)}개 분석 완료"
                         )
@@ -637,20 +578,14 @@ if st.button("전체 분석 시작", type="primary"):
                 emotion_df = pd.DataFrame(emotion_results)
 
                 st.subheader("댓글별 감정 결과")
-                st.dataframe(
-                    emotion_df,
-                    use_container_width=True
-                )
+                st.dataframe(emotion_df, use_container_width=True)
 
                 st.subheader("긍정·부정·중립 비율")
 
                 counts = (
                     emotion_df["감정 분류"]
                     .value_counts()
-                    .reindex(
-                        ["긍정", "부정", "중립"],
-                        fill_value=0
-                    )
+                    .reindex(["긍정", "부정", "중립"], fill_value=0)
                 )
 
                 st.bar_chart(counts)
@@ -658,25 +593,12 @@ if st.button("전체 분석 시작", type="primary"):
                 total = max(len(emotion_df), 1)
                 a, b, c = st.columns(3)
 
-                a.metric(
-                    "긍정",
-                    f"{counts['긍정'] / total * 100:.1f}%"
-                )
-
-                b.metric(
-                    "부정",
-                    f"{counts['부정'] / total * 100:.1f}%"
-                )
-
-                c.metric(
-                    "중립",
-                    f"{counts['중립'] / total * 100:.1f}%"
-                )
+                a.metric("긍정", f"{counts['긍정'] / total * 100:.1f}%")
+                b.metric("부정", f"{counts['부정'] / total * 100:.1f}%")
+                c.metric("중립", f"{counts['중립'] / total * 100:.1f}%")
 
                 st.subheader("세부 감정 빈도")
-                st.bar_chart(
-                    emotion_df["세부 감정"].value_counts()
-                )
+                st.bar_chart(emotion_df["세부 감정"].value_counts())
 
                 if export_results:
                     download_buttons(
@@ -722,18 +644,12 @@ if st.button("전체 분석 시작", type="primary"):
                         detail_snippet = item.get("snippet", {})
 
                         video_details.append({
-                            "영상 제목": detail_snippet.get(
-                                "title", ""
-                            ),
+                            "영상 제목": detail_snippet.get("title", ""),
                             "업로드 날짜": detail_snippet.get(
                                 "publishedAt", ""
                             )[:10],
-                            "조회수": safe_int(
-                                stats.get("viewCount")
-                            ),
-                            "좋아요": safe_int(
-                                stats.get("likeCount")
-                            ),
+                            "조회수": safe_int(stats.get("viewCount")),
+                            "좋아요": safe_int(stats.get("likeCount")),
                             "영상 링크": (
                                 "https://www.youtube.com/watch?v="
                                 + item["id"]
@@ -744,7 +660,6 @@ if st.button("전체 분석 시작", type="primary"):
 
                 if channel_df.empty:
                     st.info("채널 영상을 찾을 수 없습니다.")
-
                 else:
                     if popular_views:
                         st.subheader("조회수 TOP 5")
@@ -754,10 +669,7 @@ if st.button("전체 분석 시작", type="primary"):
                             ascending=False
                         ).head(5)
 
-                        st.dataframe(
-                            views_top,
-                            use_container_width=True
-                        )
+                        st.dataframe(views_top, use_container_width=True)
 
                         if export_results:
                             download_buttons(
@@ -773,10 +685,7 @@ if st.button("전체 분석 시작", type="primary"):
                             ascending=False
                         ).head(5)
 
-                        st.dataframe(
-                            likes_top,
-                            use_container_width=True
-                        )
+                        st.dataframe(likes_top, use_container_width=True)
 
                         if export_results:
                             download_buttons(
@@ -790,9 +699,7 @@ if st.button("전체 분석 시작", type="primary"):
                     )
 
             except HttpError as e:
-                st.warning(
-                    "채널 인기 영상 정보를 가져오지 못했습니다."
-                )
+                st.warning("채널 인기 영상 정보를 가져오지 못했습니다.")
                 st.caption(str(e))
 
     except HttpError as e:
