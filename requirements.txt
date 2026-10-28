@@ -1,9 +1,9 @@
+
 streamlit
 google-api-python-client
 pandas
-matplotlib
 wordcloud
 openpyxl
 transformers
 torch
-koreanize-matplotlib
+requests
