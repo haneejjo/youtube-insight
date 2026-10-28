@@ -1,8 +1,9 @@
+
 streamlit
 google-api-python-client
 pandas
 openpyxl
-transformers
+transformers>=4.44,<5
 torch
 faster-whisper
 av>=11,<19
