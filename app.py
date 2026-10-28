@@ -1,11 +1,9 @@
 
-import os
 import re
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
-import requests
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -16,7 +14,7 @@ st.set_page_config(
 )
 
 st.title("YouTube Insight")
-st.write("유튜브 영상과 댓글을 분석하는 통합 분석 도구")
+st.write("영상 핵심 요약과 댓글 분석을 한곳에서 확인하세요.")
 
 
 # -------------------------
@@ -50,11 +48,7 @@ def excel_bytes(df):
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(
-            writer,
-            index=False,
-            sheet_name="분석 결과"
-        )
+        df.to_excel(writer, index=False, sheet_name="분석 결과")
 
     return output.getvalue()
 
@@ -65,10 +59,7 @@ def download_buttons(df, filename):
     with col1:
         st.download_button(
             "CSV 다운로드",
-            data=df.to_csv(
-                index=False,
-                encoding="utf-8-sig"
-            ),
+            data=df.to_csv(index=False, encoding="utf-8-sig"),
             file_name=f"{filename}.csv",
             mime="text/csv",
             key=f"{filename}_csv"
@@ -85,39 +76,123 @@ def download_buttons(df, filename):
 
 
 # -------------------------
-# 한글 폰트 자동 준비
+# 영상 자막 가져오기
+# -------------------------
+
+def get_video_transcript(video_id):
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    transcript = YouTubeTranscriptApi().fetch(
+        video_id,
+        languages=["ko", "en"]
+    )
+
+    segments = transcript.to_raw_data()
+
+    text = " ".join(
+        segment.get("text", "").replace("\n", " ").strip()
+        for segment in segments
+        if segment.get("text", "").strip()
+    )
+
+    if not text:
+        raise ValueError("자막 내용이 비어 있습니다.")
+
+    return text, transcript.language
+
+
+# -------------------------
+# 한국어 영상 요약 모델
 # -------------------------
 
 @st.cache_resource
-def get_korean_font():
-    import requests
+def load_summary_model():
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-    font_path = "/tmp/NanumGothic.ttf"
+    model_name = "eenzeenee/t5-small-korean-summarization"
 
-    # 이미 내려받은 폰트가 있으면 재사용
-    if os.path.exists(font_path) and os.path.getsize(font_path) > 10000:
-        return font_path
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model.eval()
 
-    font_url = (
-        "https://raw.githubusercontent.com/google/fonts/main/"
-        "ofl/nanumgothic/NanumGothic%5Bwght%5D.ttf"
+    return tokenizer, model
+
+
+def summarize_one_chunk(text, tokenizer, model):
+    inputs = tokenizer(
+        "summarize: " + text,
+        return_tensors="pt",
+        max_length=512,
+        truncation=True
     )
 
-    response = requests.get(font_url, timeout=30)
-    response.raise_for_status()
+    output = model.generate(
+        **inputs,
+        max_new_tokens=100,
+        num_beams=2,
+        no_repeat_ngram_size=2,
+        early_stopping=True
+    )
 
-    # 내려받은 파일이 실제 폰트 파일인지 확인
-    if not response.content.startswith(b"\x00\x01\x00\x00"):
-        raise ValueError("다운로드한 파일이 올바른 TTF 폰트가 아닙니다.")
+    return tokenizer.decode(
+        output[0],
+        skip_special_tokens=True
+    ).strip()
 
-    with open(font_path, "wb") as font_file:
-        font_file.write(response.content)
 
-    return font_path
+def summarize_transcript(text, tokenizer, model):
+    # 긴 자막을 여러 조각으로 나눠 요약한 뒤 다시 압축합니다.
+    current_text = text
+
+    for _ in range(4):
+        token_ids = tokenizer.encode(
+            current_text,
+            add_special_tokens=False
+        )
+
+        if len(token_ids) <= 400:
+            return summarize_one_chunk(
+                current_text,
+                tokenizer,
+                model
+            )
+
+        chunks = []
+
+        for start in range(0, len(token_ids), 400):
+            chunk_ids = token_ids[start:start + 400]
+            chunk_text = tokenizer.decode(
+                chunk_ids,
+                skip_special_tokens=True
+            )
+
+            if chunk_text.strip():
+                chunks.append(chunk_text)
+
+        summaries = []
+
+        for index, chunk in enumerate(chunks):
+            summaries.append(
+                summarize_one_chunk(chunk, tokenizer, model)
+            )
+
+        current_text = " ".join(
+            summary for summary in summaries if summary
+        )
+
+        if not current_text.strip():
+            raise ValueError("요약 결과가 비어 있습니다.")
+
+    # 남은 요약문이 길면 모델 입력 길이에 맞춰 마지막으로 압축합니다.
+    return summarize_one_chunk(
+        current_text,
+        tokenizer,
+        model
+    )
 
 
 # -------------------------
-# 감정 분석 모델
+# 댓글 감정 분석 모델
 # -------------------------
 
 @st.cache_resource
@@ -188,7 +263,7 @@ def classify_sentiment(prediction):
 
 
 # -------------------------
-# 화면 입력
+# 사용자 입력
 # -------------------------
 
 video_url = st.text_input(
@@ -198,23 +273,22 @@ video_url = st.text_input(
 
 st.subheader("분석할 기능")
 
-col1, col2 = st.columns(2)
+left, right = st.columns(2)
 
-with col1:
+with left:
     video_stats = st.checkbox("영상 정보 분석", value=True)
+    video_summary = st.checkbox("영상 핵심 요약", value=True)
     comment_analysis = st.checkbox("댓글 감정 분석", value=True)
-    wordcloud_analysis = st.checkbox("워드클라우드", value=True)
 
-with col2:
+with right:
     popular_views = st.checkbox("채널 조회수 TOP 5", value=True)
     popular_likes = st.checkbox("채널 좋아요 TOP 5", value=True)
     export_results = st.checkbox("CSV·엑셀 다운로드", value=True)
 
 st.caption("댓글은 최대 300개까지 수집합니다.")
 
-
 # -------------------------
-# 전체 분석 실행
+# 분석 시작
 # -------------------------
 
 if st.button("전체 분석 시작", type="primary"):
@@ -240,8 +314,7 @@ if st.button("전체 분석 시작", type="primary"):
 
     except KeyError:
         st.error(
-            "YouTube API 키를 찾을 수 없습니다. "
-            "Streamlit Secrets에 YOUTUBE_API_KEY가 있는지 확인해 주세요."
+            "Streamlit Secrets에 YOUTUBE_API_KEY가 설정되어 있는지 확인해 주세요."
         )
         st.stop()
 
@@ -265,9 +338,8 @@ if st.button("전체 분석 시작", type="primary"):
         channel_id = snippet["channelId"]
 
         # 1. 영상 정보
-        st.header("1. 영상 정보")
-
         if video_stats:
+            st.header("1. 영상 정보")
             st.subheader(snippet.get("title", "제목 없음"))
             st.write(f"채널: {snippet.get('channelTitle', '')}")
             st.write(
@@ -289,16 +361,72 @@ if st.button("전체 분석 시작", type="primary"):
                 f"{safe_int(statistics.get('commentCount')):,}"
             )
 
-        # 2. 댓글 수집
-        comments = []
-
-        if comment_analysis or wordcloud_analysis:
-            st.header("2. 댓글 수집")
+        # 2. 영상 핵심 요약
+        if video_summary:
+            st.header("2. 영상 핵심 요약")
 
             try:
-                next_page_token = None
+                with st.spinner("영상 자막을 가져오고 있습니다..."):
+                    transcript_text, transcript_language = (
+                        get_video_transcript(video_id)
+                    )
 
+                st.caption(f"분석에 사용한 자막 언어: {transcript_language}")
+
+                with st.spinner(
+                    "AI가 영상의 핵심 내용을 요약하고 있습니다. "
+                    "처음에는 모델 다운로드 때문에 오래 걸릴 수 있습니다."
+                ):
+                    tokenizer, summary_model = load_summary_model()
+
+                    summary_text = summarize_transcript(
+                        transcript_text,
+                        tokenizer,
+                        summary_model
+                    )
+
+                if summary_text:
+                    st.subheader("핵심 요약")
+                    st.write(summary_text)
+
+                    st.info(
+                        "이 요약은 영상 자막을 바탕으로 생성됩니다. "
+                        "자막에 없는 시각 정보나 장면은 포함되지 않을 수 있습니다."
+                    )
+
+                    if export_results:
+                        summary_df = pd.DataFrame([{
+                            "영상 제목": snippet.get("title", ""),
+                            "영상 링크": video_url.strip(),
+                            "자막 언어": transcript_language,
+                            "핵심 요약": summary_text
+                        }])
+
+                        download_buttons(
+                            summary_df,
+                            "youtube_video_summary"
+                        )
+
+                else:
+                    st.warning("요약 결과가 비어 있습니다.")
+
+            except Exception as e:
+                st.error(
+                    "영상 요약에 실패했습니다. "
+                    "자막이 없거나 서버에서 자막을 가져오지 못했을 수 있습니다."
+                )
+                st.caption(str(e))
+
+        # 3. 댓글 수집
+        comments = []
+
+        if comment_analysis:
+            st.header("3. 댓글 수집")
+
+            try:
                 with st.spinner("댓글을 수집하고 있습니다..."):
+                    next_page_token = None
+
                     while len(comments) < 300:
                         result = youtube.commentThreads().list(
                             part="snippet",
@@ -327,23 +455,19 @@ if st.button("전체 분석 시작", type="primary"):
 
             except HttpError as e:
                 st.warning(
-                    "댓글을 가져오지 못했습니다. "
+                    "댓글을 수집하지 못했습니다. "
                     "댓글이 비활성화된 영상일 수 있습니다."
                 )
                 st.caption(str(e))
 
         comments_df = pd.DataFrame({"댓글": comments})
 
-        if comments:
-            with st.expander("수집한 댓글 보기"):
-                st.dataframe(comments_df, use_container_width=True)
+        if comments and export_results:
+            download_buttons(comments_df, "youtube_comments")
 
-            if export_results:
-                download_buttons(comments_df, "youtube_comments")
-
-        # 3. 감정 분석
+        # 4. 댓글 감정 분석
         if comment_analysis and comments:
-            st.header("3. 댓글 감정 분석")
+            st.header("4. 댓글 감정 분석")
 
             try:
                 model = load_emotion_model()
@@ -353,10 +477,7 @@ if st.button("전체 분석 시작", type="primary"):
                 status = st.empty()
                 batch_size = 8
 
-                with st.spinner(
-                    "AI가 댓글의 감정을 분석하고 있습니다. "
-                    "첫 실행은 시간이 걸릴 수 있습니다."
-                ):
+                with st.spinner("AI가 댓글 감정을 분석하고 있습니다..."):
                     for start in range(0, len(comments), batch_size):
                         batch = comments[start:start + batch_size]
 
@@ -393,9 +514,9 @@ if st.button("전체 분석 시작", type="primary"):
                 st.subheader("댓글별 감정 결과")
                 st.dataframe(emotion_df, use_container_width=True)
 
-                st.subheader("긍정·부정·중립 그래프")
+                st.subheader("긍정·부정·중립 비율")
 
-                sentiment_counts = (
+                counts = (
                     emotion_df["감정 분류"]
                     .value_counts()
                     .reindex(
@@ -404,23 +525,14 @@ if st.button("전체 분석 시작", type="primary"):
                     )
                 )
 
-                st.bar_chart(sentiment_counts)
+                st.bar_chart(counts)
 
                 total = max(len(emotion_df), 1)
                 a, b, c = st.columns(3)
 
-                a.metric(
-                    "긍정",
-                    f"{sentiment_counts['긍정'] / total * 100:.1f}%"
-                )
-                b.metric(
-                    "부정",
-                    f"{sentiment_counts['부정'] / total * 100:.1f}%"
-                )
-                c.metric(
-                    "중립",
-                    f"{sentiment_counts['중립'] / total * 100:.1f}%"
-                )
+                a.metric("긍정", f"{counts['긍정'] / total * 100:.1f}%")
+                b.metric("부정", f"{counts['부정'] / total * 100:.1f}%")
+                c.metric("중립", f"{counts['중립'] / total * 100:.1f}%")
 
                 st.subheader("세부 감정 빈도")
                 st.bar_chart(emotion_df["세부 감정"].value_counts())
@@ -434,41 +546,6 @@ if st.button("전체 분석 시작", type="primary"):
             except Exception as e:
                 st.error("감정 분석 중 오류가 발생했습니다.")
                 st.code(str(e))
-
-        # 4. 워드클라우드
-        if wordcloud_analysis and comments:
-            st.header("4. 댓글 워드클라우드")
-
-            try:
-                from wordcloud import WordCloud
-
-                with st.spinner("한글 폰트를 준비하고 워드클라우드를 만듭니다..."):
-                    font_path = get_korean_font()
-
-                    text = " ".join(comments)
-
-                    cloud = WordCloud(
-                        font_path=font_path,
-                        width=1200,
-                        height=600,
-                        background_color="white",
-                        max_words=100,
-                        collocations=False
-                    ).generate(text)
-
-                st.image(
-                    cloud.to_array(),
-                    caption="댓글에서 자주 등장하는 단어",
-                    use_container_width=True
-                )
-
-            except Exception as e:
-                st.error("워드클라우드 생성에 실패했습니다.")
-                st.code(str(e))
-                st.info(
-                    "폰트 다운로드가 서버에서 차단되었거나 "
-                    "워드클라우드 생성에 실패했을 수 있습니다."
-                )
 
         # 5. 채널 인기 영상 TOP 5
         if popular_views or popular_likes:
@@ -554,8 +631,7 @@ if st.button("전체 분석 시작", type="primary"):
                             )
 
                     st.caption(
-                        "TOP 5는 YouTube API가 조회한 채널 영상 최대 50개를 "
-                        "기준으로 계산합니다."
+                        "TOP 5는 YouTube API가 검색한 채널 영상 최대 50개를 기준으로 합니다."
                     )
 
             except HttpError as e:
