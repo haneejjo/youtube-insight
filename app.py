@@ -1,10 +1,11 @@
 
+import os
 import re
-from collections import Counter
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+import requests
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -45,45 +46,74 @@ def safe_int(value):
         return 0
 
 
-def excel_bytes(dataframe):
+def excel_bytes(df):
     output = BytesIO()
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        dataframe.to_excel(
+        df.to_excel(
             writer,
             index=False,
             sheet_name="분석 결과"
         )
+
     return output.getvalue()
 
 
-def download_buttons(dataframe, filename):
-    csv_data = dataframe.to_csv(
-        index=False,
-        encoding="utf-8-sig"
-    )
-
+def download_buttons(df, filename):
     col1, col2 = st.columns(2)
 
     with col1:
         st.download_button(
             "CSV 다운로드",
-            data=csv_data,
+            data=df.to_csv(
+                index=False,
+                encoding="utf-8-sig"
+            ),
             file_name=f"{filename}.csv",
             mime="text/csv",
             key=f"{filename}_csv"
         )
 
     with col2:
-        try:
-            st.download_button(
-                "엑셀 다운로드",
-                data=excel_bytes(dataframe),
-                file_name=f"{filename}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"{filename}_xlsx"
-            )
-        except Exception as e:
-            st.warning(f"엑셀 파일 생성 실패: {e}")
+        st.download_button(
+            "엑셀 다운로드",
+            data=excel_bytes(df),
+            file_name=f"{filename}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{filename}_xlsx"
+        )
+
+
+# -------------------------
+# 한글 폰트 자동 준비
+# -------------------------
+
+@st.cache_resource
+def get_korean_font():
+    import requests
+
+    font_path = "/tmp/NanumGothic.ttf"
+
+    # 이미 내려받은 폰트가 있으면 재사용
+    if os.path.exists(font_path) and os.path.getsize(font_path) > 10000:
+        return font_path
+
+    font_url = (
+        "https://raw.githubusercontent.com/google/fonts/main/"
+        "ofl/nanumgothic/NanumGothic%5Bwght%5D.ttf"
+    )
+
+    response = requests.get(font_url, timeout=30)
+    response.raise_for_status()
+
+    # 내려받은 파일이 실제 폰트 파일인지 확인
+    if not response.content.startswith(b"\x00\x01\x00\x00"):
+        raise ValueError("다운로드한 파일이 올바른 TTF 폰트가 아닙니다.")
+
+    with open(font_path, "wb") as font_file:
+        font_file.write(response.content)
+
+    return font_path
 
 
 # -------------------------
@@ -158,7 +188,7 @@ def classify_sentiment(prediction):
 
 
 # -------------------------
-# 입력 및 분석 항목
+# 화면 입력
 # -------------------------
 
 video_url = st.text_input(
@@ -178,12 +208,13 @@ with col1:
 with col2:
     popular_views = st.checkbox("채널 조회수 TOP 5", value=True)
     popular_likes = st.checkbox("채널 좋아요 TOP 5", value=True)
-    export_results = st.checkbox("분석 결과 CSV·엑셀 다운로드", value=True)
+    export_results = st.checkbox("CSV·엑셀 다운로드", value=True)
 
 st.caption("댓글은 최대 300개까지 수집합니다.")
 
+
 # -------------------------
-# 분석 시작
+# 전체 분석 실행
 # -------------------------
 
 if st.button("전체 분석 시작", type="primary"):
@@ -209,8 +240,8 @@ if st.button("전체 분석 시작", type="primary"):
 
     except KeyError:
         st.error(
-            "YouTube API 키가 없습니다. "
-            "Streamlit Secrets에 YOUTUBE_API_KEY를 설정해 주세요."
+            "YouTube API 키를 찾을 수 없습니다. "
+            "Streamlit Secrets에 YOUTUBE_API_KEY가 있는지 확인해 주세요."
         )
         st.stop()
 
@@ -232,17 +263,15 @@ if st.button("전체 분석 시작", type="primary"):
         snippet = video["snippet"]
         statistics = video["statistics"]
         channel_id = snippet["channelId"]
-        channel_title = snippet.get("channelTitle", "")
 
+        # 1. 영상 정보
         st.header("1. 영상 정보")
 
         if video_stats:
             st.subheader(snippet.get("title", "제목 없음"))
-
-            st.write(f"채널: {channel_title}")
+            st.write(f"채널: {snippet.get('channelTitle', '')}")
             st.write(
-                f"업로드 날짜: "
-                f"{snippet.get('publishedAt', '')[:10]}"
+                f"업로드 날짜: {snippet.get('publishedAt', '')[:10]}"
             )
 
             c1, c2, c3 = st.columns(3)
@@ -251,21 +280,16 @@ if st.button("전체 분석 시작", type="primary"):
                 "조회수",
                 f"{safe_int(statistics.get('viewCount')):,}"
             )
-
             c2.metric(
                 "좋아요",
                 f"{safe_int(statistics.get('likeCount')):,}"
             )
-
             c3.metric(
                 "댓글 수",
                 f"{safe_int(statistics.get('commentCount')):,}"
             )
 
-        # -------------------------
-        # 댓글 수집
-        # -------------------------
-
+        # 2. 댓글 수집
         comments = []
 
         if comment_analysis or wordcloud_analysis:
@@ -276,15 +300,13 @@ if st.button("전체 분석 시작", type="primary"):
 
                 with st.spinner("댓글을 수집하고 있습니다..."):
                     while len(comments) < 300:
-                        request = youtube.commentThreads().list(
+                        result = youtube.commentThreads().list(
                             part="snippet",
                             videoId=video_id,
                             maxResults=min(100, 300 - len(comments)),
-                            textFormat="plainText",
-                            pageToken=next_page_token
-                        )
-
-                        result = request.execute()
+                            pageToken=next_page_token,
+                            textFormat="plainText"
+                        ).execute()
 
                         for item in result.get("items", []):
                             comment = (
@@ -305,7 +327,7 @@ if st.button("전체 분석 시작", type="primary"):
 
             except HttpError as e:
                 st.warning(
-                    "댓글을 수집하지 못했습니다. "
+                    "댓글을 가져오지 못했습니다. "
                     "댓글이 비활성화된 영상일 수 있습니다."
                 )
                 st.caption(str(e))
@@ -313,19 +335,13 @@ if st.button("전체 분석 시작", type="primary"):
         comments_df = pd.DataFrame({"댓글": comments})
 
         if comments:
-            with st.expander("수집한 댓글 확인"):
-                st.dataframe(
-                    comments_df,
-                    use_container_width=True
-                )
+            with st.expander("수집한 댓글 보기"):
+                st.dataframe(comments_df, use_container_width=True)
 
             if export_results:
                 download_buttons(comments_df, "youtube_comments")
 
-        # -------------------------
-        # 댓글 감정 분석
-        # -------------------------
-
+        # 3. 감정 분석
         if comment_analysis and comments:
             st.header("3. 댓글 감정 분석")
 
@@ -338,8 +354,8 @@ if st.button("전체 분석 시작", type="primary"):
                 batch_size = 8
 
                 with st.spinner(
-                    "AI 모델로 댓글의 감정을 분석하고 있습니다. "
-                    "처음에는 시간이 걸릴 수 있습니다."
+                    "AI가 댓글의 감정을 분석하고 있습니다. "
+                    "첫 실행은 시간이 걸릴 수 있습니다."
                 ):
                     for start in range(0, len(comments), batch_size):
                         batch = comments[start:start + batch_size]
@@ -374,13 +390,10 @@ if st.button("전체 분석 시작", type="primary"):
 
                 emotion_df = pd.DataFrame(emotion_results)
 
-                st.subheader("댓글별 분석 결과")
-                st.dataframe(
-                    emotion_df,
-                    use_container_width=True
-                )
+                st.subheader("댓글별 감정 결과")
+                st.dataframe(emotion_df, use_container_width=True)
 
-                st.subheader("긍정·부정·중립 분포")
+                st.subheader("긍정·부정·중립 그래프")
 
                 sentiment_counts = (
                     emotion_df["감정 분류"]
@@ -410,9 +423,7 @@ if st.button("전체 분석 시작", type="primary"):
                 )
 
                 st.subheader("세부 감정 빈도")
-
-                emotion_counts = emotion_df["세부 감정"].value_counts()
-                st.bar_chart(emotion_counts)
+                st.bar_chart(emotion_df["세부 감정"].value_counts())
 
                 if export_results:
                     download_buttons(
@@ -423,52 +434,27 @@ if st.button("전체 분석 시작", type="primary"):
             except Exception as e:
                 st.error("감정 분석 중 오류가 발생했습니다.")
                 st.code(str(e))
-                st.info(
-                    "모델 다운로드, 메모리 또는 라이브러리 문제일 수 있습니다."
-                )
 
-        # -------------------------
-        # 워드클라우드
-        # -------------------------
-
+        # 4. 워드클라우드
         if wordcloud_analysis and comments:
             st.header("4. 댓글 워드클라우드")
 
             try:
                 from wordcloud import WordCloud
 
-                text = " ".join(comments)
+                with st.spinner("한글 폰트를 준비하고 워드클라우드를 만듭니다..."):
+                    font_path = get_korean_font()
 
-                # 한글 폰트 경로 탐색
-                import os
+                    text = " ".join(comments)
 
-                font_candidates = [
-                    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-                ]
-
-                font_path = next(
-                    (
-                        path for path in font_candidates
-                        if os.path.exists(path)
-                    ),
-                    None
-                )
-
-                if font_path is None:
-                    st.warning(
-                        "서버에서 한글 폰트를 찾지 못해 "
-                        "워드클라우드 한글 표시가 제한될 수 있습니다."
-                    )
-
-                cloud = WordCloud(
-                    font_path=font_path,
-                    width=1000,
-                    height=500,
-                    background_color="white",
-                    max_words=100
-                ).generate(text)
+                    cloud = WordCloud(
+                        font_path=font_path,
+                        width=1200,
+                        height=600,
+                        background_color="white",
+                        max_words=100,
+                        collocations=False
+                    ).generate(text)
 
                 st.image(
                     cloud.to_array(),
@@ -477,12 +463,14 @@ if st.button("전체 분석 시작", type="primary"):
                 )
 
             except Exception as e:
-                st.error(f"워드클라우드 생성 실패: {e}")
+                st.error("워드클라우드 생성에 실패했습니다.")
+                st.code(str(e))
+                st.info(
+                    "폰트 다운로드가 서버에서 차단되었거나 "
+                    "워드클라우드 생성에 실패했을 수 있습니다."
+                )
 
-        # -------------------------
-        # 채널 인기 영상 TOP 5
-        # -------------------------
-
+        # 5. 채널 인기 영상 TOP 5
         if popular_views or popular_likes:
             st.header("5. 채널 인기 영상 TOP 5")
 
@@ -496,6 +484,7 @@ if st.button("전체 분석 시작", type="primary"):
                 ).execute()
 
                 channel_videos = channel_response.get("items", [])
+
                 video_ids = [
                     item["id"]["videoId"]
                     for item in channel_videos
@@ -504,10 +493,10 @@ if st.button("전체 분석 시작", type="primary"):
 
                 video_details = []
 
-                for i in range(0, len(video_ids), 50):
+                for start in range(0, len(video_ids), 50):
                     detail_response = youtube.videos().list(
                         part="snippet,statistics",
-                        id=",".join(video_ids[i:i + 50])
+                        id=",".join(video_ids[start:start + 50])
                     ).execute()
 
                     for item in detail_response.get("items", []):
@@ -540,10 +529,7 @@ if st.button("전체 분석 시작", type="primary"):
                             ascending=False
                         ).head(5)
 
-                        st.dataframe(
-                            views_top,
-                            use_container_width=True
-                        )
+                        st.dataframe(views_top, use_container_width=True)
 
                         if export_results:
                             download_buttons(
@@ -559,10 +545,7 @@ if st.button("전체 분석 시작", type="primary"):
                             ascending=False
                         ).head(5)
 
-                        st.dataframe(
-                            likes_top,
-                            use_container_width=True
-                        )
+                        st.dataframe(likes_top, use_container_width=True)
 
                         if export_results:
                             download_buttons(
@@ -570,10 +553,13 @@ if st.button("전체 분석 시작", type="primary"):
                                 "channel_likes_top5"
                             )
 
+                    st.caption(
+                        "TOP 5는 YouTube API가 조회한 채널 영상 최대 50개를 "
+                        "기준으로 계산합니다."
+                    )
+
             except HttpError as e:
-                st.warning(
-                    "채널 인기 영상 정보를 가져오지 못했습니다."
-                )
+                st.warning("채널 인기 영상 정보를 가져오지 못했습니다.")
                 st.caption(str(e))
 
     except HttpError as e:
@@ -581,5 +567,5 @@ if st.button("전체 분석 시작", type="primary"):
         st.code(str(e))
 
     except Exception as e:
-        st.error("분석 중 예상하지 못한 오류가 발생했습니다.")
+        st.error("분석 중 오류가 발생했습니다.")
         st.code(str(e))
