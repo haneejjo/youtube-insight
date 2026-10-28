@@ -6,5 +6,4 @@ openpyxl
 transformers
 torch
 faster-whisper
-yt-dlp[default]>=2026.10.0
 sentencepiece
