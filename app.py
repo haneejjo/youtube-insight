@@ -98,10 +98,65 @@ if st.button("분석 시작", type="primary"):
                         f'{int(stats.get("commentCount", 0)):,}'
                     )
 
-            if comment_analysis or wordcloud_analysis:
-                st.info(
-                    "댓글 분석과 워드클라우드는 다음 단계에서 연결할게요."
-                )
+            
+if comment_analysis or wordcloud_analysis:
+    st.markdown("## 댓글 수집")
+
+    try:
+        comment_rows = []
+        next_page_token = None
+
+        with st.spinner("댓글을 수집하고 있어요..."):
+            while len(comment_rows) < 300:
+                response = youtube.commentThreads().list(
+                    part="snippet",
+                    videoId=video_id,
+                    maxResults=min(100, 300 - len(comment_rows)),
+                    pageToken=next_page_token,
+                    textFormat="plainText"
+                ).execute()
+
+                for item in response.get("items", []):
+                    comment = item["snippet"]["topLevelComment"]["snippet"]
+
+                    comment_rows.append({
+                        "작성자": comment.get("authorDisplayName", ""),
+                        "댓글": comment.get("textDisplay", ""),
+                        "좋아요 수": comment.get("likeCount", 0),
+                        "작성일": comment.get("publishedAt", "")
+                    })
+
+                next_page_token = response.get("nextPageToken")
+
+                if not next_page_token:
+                    break
+
+        if comment_rows:
+            comments_df = pd.DataFrame(comment_rows)
+
+            st.success(f"댓글 {len(comments_df)}개를 수집했어요.")
+            st.dataframe(comments_df, use_container_width=True)
+
+            csv_data = comments_df.to_csv(
+                index=False,
+                encoding="utf-8-sig"
+            )
+
+            st.download_button(
+                "댓글 CSV 다운로드",
+                data=csv_data,
+                file_name="youtube_comments.csv",
+                mime="text/csv"
+            )
+        else:
+            st.warning("수집할 댓글이 없거나 댓글이 비활성화된 영상이에요.")
+
+    except HttpError as e:
+        st.error(
+            "댓글을 가져오지 못했어요. 댓글이 비활성화된 영상인지 "
+            "또는 API 요청 제한에 걸렸는지 확인해 주세요."
+        )
+
 
             if popular_views or popular_likes:
                 st.info(
