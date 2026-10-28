@@ -2,6 +2,7 @@
 import os
 import re
 import tempfile
+from io import BytesIO
 from urllib.parse import urlparse, parse_qs
 
 import pandas as pd
@@ -11,9 +12,10 @@ from transformers import pipeline
 from faster_whisper import WhisperModel
 
 
-# ==========================================
-# 1. 기본 설정
-# ==========================================
+# =========================================================
+# 페이지 설정
+# =========================================================
+
 st.set_page_config(
     page_title="YouTube Insight",
     page_icon="📊",
@@ -21,99 +23,116 @@ st.set_page_config(
 )
 
 st.title("📊 YouTube Insight")
-st.write("유튜브 영상의 정보와 댓글, 감정, 핵심 내용을 분석합니다.")
-
-API_KEY = st.secrets.get("YOUTUBE_API_KEY", "")
+st.caption("유튜브 영상 정보 · 댓글 감정 분석 · 채널 인기 영상 · 핵심 요약")
 
 
-# ==========================================
-# 2. 유튜브 영상 ID 추출
-# ==========================================
-def get_video_id(url):
+# =========================================================
+# YouTube API
+# =========================================================
+
+def get_api_key():
+    """Streamlit Secrets 또는 환경 변수에서 API 키를 가져온다."""
     try:
-        parsed = urlparse(url.strip())
-        host = parsed.hostname or ""
-
-        if host in ("youtu.be", "www.youtu.be"):
-            return parsed.path.strip("/").split("/")[0]
-
-        if host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
-            if parsed.path == "/watch":
-                return parse_qs(parsed.query).get("v", [None])[0]
-
-            parts = parsed.path.strip("/").split("/")
-            if len(parts) >= 2 and parts[0] in ("shorts", "embed", "live"):
-                return parts[1]
-
+        key = st.secrets.get("YOUTUBE_API_KEY", "")
     except Exception:
-        pass
+        key = ""
 
-    return None
+    if not key:
+        key = os.environ.get("YOUTUBE_API_KEY", "")
+
+    return key
 
 
-# ==========================================
-# 3. YouTube API 연결
-# ==========================================
 @st.cache_resource
 def get_youtube_service(api_key):
-    return build("youtube", "v3", developerKey=api_key)
+    return build(
+        "youtube",
+        "v3",
+        developerKey=api_key,
+        cache_discovery=False
+    )
 
 
-# ==========================================
-# 4. 영상 정보 가져오기
-# ==========================================
+def get_video_id(url):
+    """일반 유튜브 주소와 Shorts 주소에서 영상 ID를 추출한다."""
+    url = url.strip()
+
+    if re.fullmatch(r"[\w-]{11}", url):
+        return url
+
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower().replace("www.", "")
+
+        if host == "youtu.be":
+            video_id = parsed.path.strip("/").split("/")[0]
+        elif host in ("youtube.com", "m.youtube.com"):
+            if parsed.path == "/watch":
+                video_id = parse_qs(parsed.query).get("v", [""])[0]
+            elif parsed.path.startswith(("/shorts/", "/embed/", "/live/")):
+                parts = parsed.path.strip("/").split("/")
+                video_id = parts[1] if len(parts) > 1 else ""
+            else:
+                video_id = ""
+        else:
+            video_id = ""
+
+        return video_id if re.fullmatch(r"[\w-]{11}", video_id) else None
+
+    except Exception:
+        return None
+
+
 def get_video_info(youtube, video_id):
+    """영상 기본 정보와 채널 정보를 가져온다."""
     response = youtube.videos().list(
-        part="snippet,statistics",
+        part="snippet,statistics,contentDetails",
         id=video_id
     ).execute()
 
     items = response.get("items", [])
+
     if not items:
         return None
 
-    item = items[0]
-    snippet = item["snippet"]
-    stats = item.get("statistics", {})
+    video = items[0]
+    snippet = video.get("snippet", {})
+    stats = video.get("statistics", {})
+    details = video.get("contentDetails", {})
+
+    channel_id = snippet.get("channelId", "")
 
     return {
-        "영상 제목": snippet.get("title", ""),
-        "채널명": snippet.get("channelTitle", ""),
-        "업로드 날짜": snippet.get("publishedAt", "")[:10],
-        "조회수": int(stats.get("viewCount", 0)),
-        "좋아요 수": int(stats.get("likeCount", 0)),
-        "댓글 수": int(stats.get("commentCount", 0)),
-        "채널 ID": snippet.get("channelId", "")
+        "video_id": video_id,
+        "title": snippet.get("title", "제목 없음"),
+        "channel": snippet.get("channelTitle", "채널 정보 없음"),
+        "channel_id": channel_id,
+        "published_at": snippet.get("publishedAt", "")[:10],
+        "description": snippet.get("description", ""),
+        "views": int(stats.get("viewCount", 0)),
+        "likes": int(stats.get("likeCount", 0)),
+        "comment_count": int(stats.get("commentCount", 0)),
+        "duration": details.get("duration", ""),
+        "url": f"https://www.youtube.com/watch?v={video_id}"
     }
 
 
-# ==========================================
-# 5. 댓글 수집
-# ==========================================
-def get_comments(youtube, video_id, max_comments=300):
+def get_comments(youtube, video_id, limit=300):
+    """영상 댓글을 최대 limit개까지 수집한다."""
     comments = []
     next_page_token = None
 
-    while len(comments) < max_comments:
-        count = min(100, max_comments - len(comments))
+    while len(comments) < limit:
+        request_count = min(100, limit - len(comments))
 
-        try:
-            response = youtube.commentThreads().list(
-                part="snippet",
-                videoId=video_id,
-                maxResults=count,
-                pageToken=next_page_token,
-                textFormat="plainText",
-                order="relevance"
-            ).execute()
-
-        except Exception as e:
-            st.warning(
-                "댓글을 가져오지 못했습니다. "
-                "댓글이 비활성화된 영상일 수도 있습니다. "
-                f"상세 내용: {e}"
-            )
-            break
+        response = youtube.commentThreads().list(
+            part="snippet",
+            videoId=video_id,
+            maxResults=request_count,
+            order="relevance",
+            textFormat="plainText",
+            pageToken=next_page_token
+        ).execute()
 
         for item in response.get("items", []):
             snippet = item["snippet"]["topLevelComment"]["snippet"]
@@ -121,143 +140,150 @@ def get_comments(youtube, video_id, max_comments=300):
             comments.append({
                 "작성자": snippet.get("authorDisplayName", ""),
                 "댓글": snippet.get("textDisplay", ""),
-                "좋아요 수": snippet.get("likeCount", 0),
-                "작성 날짜": snippet.get("publishedAt", "")[:10]
+                "좋아요": snippet.get("likeCount", 0),
+                "작성일": snippet.get("publishedAt", "")[:10]
             })
 
         next_page_token = response.get("nextPageToken")
+
         if not next_page_token:
             break
 
-    return pd.DataFrame(comments)
+    return comments
 
 
-# ==========================================
-# 6. 댓글 감정 분석
-# ==========================================
-@st.cache_resource
-def load_emotion_model():
-    return pipeline(
-        "text-classification",
-        model="searle-j/kote_for_easygoing_people",
-        tokenizer="searle-j/kote_for_easygoing_people"
-    )
-
-
-def analyze_emotions(comments_df):
-    if comments_df.empty:
-        return comments_df
-
-    model = load_emotion_model()
-    result_df = comments_df.copy()
-    texts = result_df["댓글"].fillna("").astype(str).tolist()
-    labels = []
-
-    progress = st.progress(0, text="댓글 감정 분석 중...")
-
-    for i, comment in enumerate(texts):
-        if not comment.strip():
-            labels.append("분석할 내용 없음")
-        else:
-            try:
-                result = model(comment[:1000], truncation=True)[0]
-                labels.append(
-                    f"{result['label']} ({result['score']:.2f})"
-                )
-            except Exception:
-                labels.append("분석 실패")
-
-        progress.progress(
-            (i + 1) / len(texts),
-            text=f"댓글 감정 분석 중... {i + 1}/{len(texts)}"
-        )
-
-    progress.empty()
-    result_df["감정 분석"] = labels
-
-    return result_df
-
-
-# ==========================================
-# 7. 채널 인기 영상 TOP 5
-# ==========================================
-def get_channel_top_videos(youtube, channel_id):
-    channel_response = youtube.channels().list(
-        part="contentDetails",
-        id=channel_id
+def get_channel_top_videos(youtube, channel_id, limit=5):
+    """채널의 최근 영상 중 조회수가 높은 영상 TOP 5를 가져온다."""
+    response = youtube.search().list(
+        part="snippet",
+        channelId=channel_id,
+        type="video",
+        order="date",
+        maxResults=50
     ).execute()
 
-    channel_items = channel_response.get("items", [])
-    if not channel_items:
-        return pd.DataFrame(), pd.DataFrame()
+    video_ids = [
+        item["id"]["videoId"]
+        for item in response.get("items", [])
+        if item.get("id", {}).get("videoId")
+    ]
 
-    playlist_id = channel_items[0]["contentDetails"][
-        "relatedPlaylists"
-    ]["uploads"]
+    if not video_ids:
+        return pd.DataFrame()
 
-    video_ids = []
-    next_page_token = None
-
-    # 채널의 최근 영상 최대 50개 확인
-    while len(video_ids) < 50:
-        response = youtube.playlistItems().list(
-            part="contentDetails",
-            playlistId=playlist_id,
-            maxResults=min(50, 50 - len(video_ids)),
-            pageToken=next_page_token
-        ).execute()
-
-        for item in response.get("items", []):
-            video_ids.append(item["contentDetails"]["videoId"])
-
-        next_page_token = response.get("nextPageToken")
-        if not next_page_token:
-            break
+    stats_response = youtube.videos().list(
+        part="snippet,statistics",
+        id=",".join(video_ids)
+    ).execute()
 
     rows = []
 
-    for start in range(0, len(video_ids), 50):
-        batch_ids = video_ids[start:start + 50]
+    for video in stats_response.get("items", []):
+        snippet = video.get("snippet", {})
+        stats = video.get("statistics", {})
+        video_id = video.get("id", "")
 
-        response = youtube.videos().list(
-            part="snippet,statistics",
-            id=",".join(batch_ids)
-        ).execute()
-
-        for item in response.get("items", []):
-            stats = item.get("statistics", {})
-
-            rows.append({
-                "영상 제목": item["snippet"].get("title", ""),
-                "업로드 날짜": item["snippet"].get("publishedAt", "")[:10],
-                "조회수": int(stats.get("viewCount", 0)),
-                "좋아요 수": int(stats.get("likeCount", 0)),
-                "영상 링크": (
-                    "https://www.youtube.com/watch?v=" + item["id"]
-                )
-            })
+        rows.append({
+            "영상 제목": snippet.get("title", ""),
+            "업로드 날짜": snippet.get("publishedAt", "")[:10],
+            "조회수": int(stats.get("viewCount", 0)),
+            "좋아요": int(stats.get("likeCount", 0)),
+            "영상 링크": f"https://www.youtube.com/watch?v={video_id}"
+        })
 
     df = pd.DataFrame(rows)
 
     if df.empty:
-        return df, df
+        return df
 
-    top_views = df.sort_values(
-        "조회수", ascending=False
-    ).head(5)
-
-    top_likes = df.sort_values(
-        "좋아요 수", ascending=False
-    ).head(5)
-
-    return top_views, top_likes
+    return (
+        df.sort_values("조회수", ascending=False)
+        .head(limit)
+        .reset_index(drop=True)
+    )
 
 
-# ==========================================
-# 8. 음성 파일을 텍스트로 변환
-# ==========================================
+# =========================================================
+# 댓글 감정 분석
+# =========================================================
+
+@st.cache_resource
+def load_emotion_model():
+    """댓글 감정 분석 모델을 한 번만 불러온다."""
+    return pipeline(
+        "text-classification",
+        model="searle-j/kote_for_easygoing_people",
+        top_k=None
+    )
+
+
+def analyze_one_emotion(model, text):
+    """댓글 하나에서 가장 점수가 높은 감정 라벨을 찾는다."""
+    if not isinstance(text, str) or not text.strip():
+        return "분석할 내용 없음", 0.0
+
+    try:
+        result = model(
+            text[:500],
+            truncation=True
+        )
+
+        # 모델에 따라 결과가 리스트 안의 리스트로 반환될 수 있다.
+        if result and isinstance(result[0], list):
+            result = result[0]
+
+        if not result:
+            return "분석 불가", 0.0
+
+        best = max(result, key=lambda x: float(x.get("score", 0)))
+
+        return (
+            str(best.get("label", "분석 불가")),
+            round(float(best.get("score", 0)), 4)
+        )
+
+    except Exception:
+        return "분석 불가", 0.0
+
+
+def analyze_comments(comments_df):
+    """댓글 전체의 감정을 분석한다."""
+    model = load_emotion_model()
+
+    labels = []
+    scores = []
+
+    progress = st.progress(0, text="댓글 감정 분석 준비 중...")
+
+    total = len(comments_df)
+
+    for index, comment in enumerate(comments_df["댓글"]):
+        label, score = analyze_one_emotion(model, comment)
+
+        labels.append(label)
+        scores.append(score)
+
+        progress.progress(
+            (index + 1) / total,
+            text=f"댓글 감정 분석 중... {index + 1}/{total}"
+        )
+
+    progress.empty()
+
+    result = comments_df.copy()
+    result["감정"] = labels
+    result["감정 점수"] = scores
+
+    return result
+
+
+# =========================================================
+# 영상 핵심 요약
+# =========================================================
+
 @st.cache_resource
 def load_whisper_model():
+    """오디오를 텍스트로 변환하는 음성 인식 모델."""
     return WhisperModel(
         "base",
         device="cpu",
@@ -265,414 +291,552 @@ def load_whisper_model():
     )
 
 
-def transcribe_audio(audio_file):
-    suffix = os.path.splitext(audio_file.name)[1] or ".mp3"
+def transcribe_audio(audio_path):
+    """오디오 파일에서 음성을 텍스트로 변환한다."""
+    model = load_whisper_model()
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        audio_path = os.path.join(temp_dir, "uploaded_audio" + suffix)
+    segments, info = model.transcribe(
+        audio_path,
+        language="ko",
+        vad_filter=True
+    )
 
-        with open(audio_path, "wb") as f:
-            f.write(audio_file.getvalue())
+    text = " ".join(
+        segment.text.strip()
+        for segment in segments
+        if segment.text.strip()
+    )
 
-        model = load_whisper_model()
-
-        segments, info = model.transcribe(
-            audio_path,
-            language="ko",
-            vad_filter=True
-        )
-
-        transcript = " ".join(
-            segment.text.strip() for segment in segments
-        )
-
-    return transcript.strip()
+    return text
 
 
-# ==========================================
-# 9. 핵심 요약 모델
-# ==========================================
 @st.cache_resource
 def load_summary_model():
+    """한국어 요약 모델."""
     return pipeline(
         "text2text-generation",
         model="eenzeenee/t5-small-korean-summarization"
     )
 
 
+def summarize_chunk(model, text):
+    """긴 텍스트의 한 부분을 요약한다."""
+    result = model(
+        text,
+        max_new_tokens=160,
+        do_sample=False,
+        truncation=True
+    )
+
+    return result[0]["generated_text"].strip()
+
+
 def choose_summary_emoji(text):
-    """요약 내용에 어울리는 이모티콘을 선택합니다."""
-    lower_text = text.lower()
+    """요약 내용에 어울리는 대표 이모지를 고른다."""
+    if any(word in text for word in ["주의", "위험", "문제", "실수"]):
+        return "⚠️"
 
-    topics = [
-        (["공부", "학교", "교육", "학습", "시험"], "📚"),
-        (["음식", "요리", "식사", "레시피", "맛"], "🍽️"),
-        (["여행", "관광", "여행지", "방문"], "✈️"),
-        (["인공지능", "기술", "컴퓨터", "ai", "로봇"], "🤖"),
-        (["경제", "돈", "가격", "비용", "시장"], "💰"),
-        (["운동", "건강", "체력", "수면"], "🌿"),
-        (["환경", "기후", "자연", "지구"], "🌎"),
-        (["음악", "노래", "가수", "공연"], "🎵"),
-        (["영화", "드라마", "배우", "연기"], "🎬"),
-        (["역사", "사건", "인물", "문화"], "🗺️")
-    ]
+    if any(word in text for word in ["방법", "설명", "배우", "공부", "정보"]):
+        return "📚"
 
-    for keywords, emoji in topics:
-        if any(word in lower_text for word in keywords):
-            return emoji
+    if any(word in text for word in ["웃", "재미", "웃기", "즐거"]):
+        return "😄"
 
-    return "💡"
+    if any(word in text for word in ["감동", "감사", "행복", "응원"]):
+        return "💛"
+
+    if any(word in text for word in ["음식", "요리", "먹", "빵", "디저트"]):
+        return "🍞"
+
+    return "🎬"
 
 
 def summarize_text(text):
+    """긴 음성 인식 텍스트를 핵심 요약으로 변환한다."""
     if not text or not text.strip():
-        return "요약할 음성이 인식되지 않았어요."
+        return "요약할 음성 내용이 없습니다."
 
     model = load_summary_model()
 
-    # 긴 대본을 여러 부분으로 나누어 요약합니다.
+    # 모델 입력 길이를 고려해 긴 글을 여러 부분으로 나눈다.
     chunks = [
-        text[i:i + 700]
-        for i in range(0, len(text), 700)
+        text[i:i + 600]
+        for i in range(0, len(text), 600)
     ]
 
-    summaries = []
+    partial_summaries = []
 
-    for i, chunk in enumerate(chunks):
-        result = model(
-            chunk,
-            max_new_tokens=128,
-            do_sample=False,
-            truncation=True
-        )
+    for index, chunk in enumerate(chunks):
+        partial_summaries.append(summarize_chunk(model, chunk))
 
-        summary_part = result[0]["generated_text"].strip()
+    combined = " ".join(
+        item for item in partial_summaries if item
+    )
 
-        if summary_part:
-            summaries.append(summary_part)
-
-    combined = " ".join(summaries).strip()
-
-    if not combined:
-        return "핵심 내용을 요약하지 못했어요. 다른 음성 파일로 다시 시도해 주세요."
-
-    # 여러 조각의 요약이 길면 다시 간결하게 정리합니다.
+    # 여러 부분의 요약이 길면 한 번 더 압축한다.
     if len(combined) > 700:
-        result = model(
-            combined[:3000],
-            max_new_tokens=160,
-            do_sample=False,
-            truncation=True
-        )
-        combined = result[0]["generated_text"].strip()
+        combined = summarize_chunk(model, combined[:3000])
 
-    # 반복되는 공백을 정리합니다.
-    combined = re.sub(r"\s+", " ", combined).strip()
+    # 문장 단위로 읽기 쉽게 정리한다.
+    sentences = re.split(r"(?<=[.!?。！？])\s*", combined.strip())
+    sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
 
-    # 읽기 쉽게 문장별 핵심 항목으로 표시합니다.
-    sentences = re.split(r"(?<=[.!?。])\s+", combined)
-    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return combined
 
     emoji = choose_summary_emoji(combined)
 
-    # 대본을 그대로 보여 주는 대신 모델이 만든 요약만 표시합니다.
-    formatted_lines = [
-        f"• {sentence}" for sentence in sentences
-    ]
-
-    return (
-        f"{emoji} 핵심 내용 요약\n\n"
-        + "\n".join(formatted_lines)
+    return "\n".join(
+        f"{emoji} {sentence}"
+        for sentence in sentences
     )
 
 
-# ==========================================
-# 10. 영상 링크 및 분석 체크박스
-# ==========================================
+# =========================================================
+# 파일 다운로드 도구
+# =========================================================
+
+def make_excel_bytes(dataframe, sheet_name="분석 결과"):
+    """DataFrame을 엑셀 파일 바이트로 변환한다."""
+    excel_buffer = BytesIO()
+
+    with pd.ExcelWriter(
+        excel_buffer,
+        engine="openpyxl"
+    ) as writer:
+        dataframe.to_excel(
+            writer,
+            index=False,
+            sheet_name=sheet_name
+        )
+
+    # Writer가 닫힌 후 완성된 파일 데이터를 가져온다.
+    return excel_buffer.getvalue()
+
+
+# =========================================================
+# 사용자 화면
+# =========================================================
+
+st.subheader("1. 분석할 유튜브 영상")
+
 video_url = st.text_input(
-    "분석할 유튜브 영상 링크",
+    "유튜브 영상 링크를 입력하세요",
     placeholder="https://www.youtube.com/watch?v=..."
 )
 
-st.subheader("분석할 항목을 선택하세요")
+st.subheader("2. 실행할 분석 기능을 선택하세요")
 
-col1, col2 = st.columns(2)
+feature_video_info = st.checkbox(
+    "영상 정보 분석",
+    value=True
+)
 
-with col1:
-    select_info = st.checkbox("영상 정보 분석", value=True)
-    select_comments = st.checkbox("댓글 수집 및 감정 분석", value=True)
+feature_comments = st.checkbox(
+    "댓글 수집 및 감정 분석",
+    value=True
+)
 
-with col2:
-    select_channel = st.checkbox("채널 인기 영상 TOP 5", value=True)
-    select_summary = st.checkbox("영상 핵심 요약", value=True)
+feature_channel_top = st.checkbox(
+    "채널 인기 영상 TOP 5",
+    value=True
+)
 
-analyze_button = st.button(
-    "영상 분석 시작",
-    type="primary"
+feature_summary = st.checkbox(
+    "영상 핵심 요약",
+    value=False
+)
+
+st.caption(
+    "핵심 요약 기능은 영상에서 추출한 오디오 파일을 이용합니다. "
+    "아래에서 오디오 파일을 업로드할 수 있습니다."
+)
+
+audio_file = None
+
+if feature_summary:
+    audio_file = st.file_uploader(
+        "영상에서 추출한 오디오 파일 업로드",
+        type=["mp3", "wav", "m4a", "mp4", "aac", "flac", "ogg"]
+    )
+
+    st.markdown(
+        "[유튜브 링크로 MP3 만드는 링크](https://media.ytmp3.gg/ko/tool/)"
+    )
+
+st.divider()
+
+run_analysis = st.button(
+    "분석 시작",
+    type="primary",
+    use_container_width=True
 )
 
 
-# ==========================================
-# 11. 분석 실행
-# ==========================================
-if analyze_button:
-    if not API_KEY:
-        st.error(
-            "YouTube API 키가 설정되지 않았습니다. "
-            "Streamlit Secrets에서 YOUTUBE_API_KEY를 확인해 주세요."
-        )
+# =========================================================
+# 분석 실행
+# =========================================================
+
+if run_analysis:
+    video_id = get_video_id(video_url) if video_url else None
+
+    if not video_id:
+        st.error("올바른 유튜브 영상 링크를 입력해 주세요.")
 
     elif not any([
-        select_info,
-        select_comments,
-        select_channel,
-        select_summary
+        feature_video_info,
+        feature_comments,
+        feature_channel_top,
+        feature_summary
     ]):
-        st.warning("분석할 항목을 하나 이상 선택해 주세요.")
+        st.warning("먼저 분석할 기능을 하나 이상 선택해 주세요.")
+
+    elif feature_summary and audio_file is None:
+        st.warning(
+            "핵심 요약을 선택했다면 오디오 파일도 업로드해 주세요. "
+            "다른 기능만 사용하려면 핵심 요약 체크를 해제하세요."
+        )
 
     else:
-        video_id = get_video_id(video_url)
+        api_key = get_api_key()
 
-        if not video_id:
-            st.error("올바른 유튜브 영상 링크를 입력해 주세요.")
+        if not api_key and any([
+            feature_video_info,
+            feature_comments,
+            feature_channel_top
+        ]):
+            st.error(
+                "YouTube API 키를 찾을 수 없습니다. "
+                "Streamlit Cloud의 앱 설정에서 "
+                "YOUTUBE_API_KEY Secrets를 확인해 주세요."
+            )
 
         else:
-            try:
-                with st.spinner("영상 정보를 확인하는 중..."):
-                    info = get_video_info(
-                        get_youtube_service(API_KEY),
-                        video_id
-                    )
+            youtube = None
 
-                if not info:
+            if api_key:
+                try:
+                    youtube = get_youtube_service(api_key)
+                except Exception as error:
+                    st.error(f"YouTube API 연결 실패: {error}")
+
+            if api_key and youtube is None:
+                st.stop()
+
+            # 영상 정보가 필요한 기능을 위해 영상 정보를 가져온다.
+            video_info = None
+
+            if youtube and any([
+                feature_video_info,
+                feature_comments,
+                feature_channel_top
+            ]):
+                try:
+                    video_info = get_video_info(youtube, video_id)
+
+                    if not video_info:
+                        st.error(
+                            "영상을 찾을 수 없습니다. "
+                            "영상 주소나 공개 상태를 확인해 주세요."
+                        )
+                        st.stop()
+
+                except Exception as error:
                     st.error(
-                        "영상을 찾지 못했습니다. "
-                        "링크와 영상 공개 상태를 확인해 주세요."
+                        "영상 정보를 가져오지 못했습니다. "
+                        "API 할당량, API 키, 영상 공개 상태를 확인해 주세요."
                     )
+                    st.exception(error)
+                    st.stop()
 
-                else:
-                    previous_video_id = st.session_state.get("video_id")
+            # -------------------------------------------------
+            # 영상 정보 분석
+            # -------------------------------------------------
 
-                    # 다른 영상으로 바꾸면 이전 영상의 분석 결과를 지웁니다.
-                    if previous_video_id != video_id:
-                        for key in [
-                            "comments_df",
-                            "top_views",
-                            "top_likes",
-                            "transcript",
-                            "summary_text"
-                        ]:
-                            st.session_state.pop(key, None)
+            if feature_video_info and video_info:
+                st.divider()
+                st.header("🎥 영상 정보 분석")
 
-                    st.session_state["video_info"] = info
-                    st.session_state["video_id"] = video_id
+                st.subheader(video_info["title"])
 
-                    st.session_state["selected_features"] = {
-                        "info": select_info,
-                        "comments": select_comments,
-                        "channel": select_channel,
-                        "summary": select_summary
-                    }
+                col1, col2, col3, col4 = st.columns(4)
 
-                    st.success("영상 정보를 불러왔습니다.")
-
-            except Exception as e:
-                st.error(f"영상 정보를 가져오지 못했습니다: {e}")
-
-
-# ==========================================
-# 12. 선택한 분석 결과 표시
-# ==========================================
-info = st.session_state.get("video_info")
-selected = st.session_state.get("selected_features", {})
-
-if info and selected:
-    youtube = get_youtube_service(API_KEY)
-
-    # --------------------------------------
-    # 영상 정보
-    # --------------------------------------
-    if selected.get("info"):
-        st.header("📊 영상 정보")
-        st.subheader(info["영상 제목"])
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("조회수", f'{info["조회수"]:,}')
-        c2.metric("좋아요 수", f'{info["좋아요 수"]:,}')
-        c3.metric("댓글 수", f'{info["댓글 수"]:,}')
-
-        st.write("**채널명:**", info["채널명"])
-        st.write("**업로드 날짜:**", info["업로드 날짜"])
-
-    # --------------------------------------
-    # 댓글 감정 분석
-    # --------------------------------------
-    if selected.get("comments"):
-        st.header("💬 댓글 수집 및 감정 분석")
-
-        if st.button("댓글 분석 실행"):
-            with st.spinner("댓글을 수집하는 중..."):
-                comments_df = get_comments(
-                    youtube,
-                    st.session_state["video_id"]
+                col1.metric(
+                    "조회수",
+                    f'{video_info["views"]:,}'
                 )
 
-            if comments_df.empty:
-                st.session_state["comments_df"] = comments_df
-                st.info("수집된 댓글이 없습니다.")
-
-            else:
-                with st.spinner("댓글 감정을 분석하는 중..."):
-                    analyzed_df = analyze_emotions(comments_df)
-
-                st.session_state["comments_df"] = analyzed_df
-                st.success(
-                    f"{len(analyzed_df)}개의 댓글을 분석했습니다."
+                col2.metric(
+                    "좋아요",
+                    f'{video_info["likes"]:,}'
                 )
 
-        comments_df = st.session_state.get("comments_df")
-
-        if comments_df is not None and not comments_df.empty:
-            st.dataframe(
-                comments_df,
-                use_container_width=True,
-                hide_index=True
-            )
-
-            st.download_button(
-                "댓글 분석 결과 CSV 다운로드",
-                data=comments_df.to_csv(
-                    index=False
-                ).encode("utf-8-sig"),
-                file_name="youtube_comments_analysis.csv",
-                mime="text/csv"
-            )
-
-            excel_buffer = tempfile.SpooledTemporaryFile()
-
-            with pd.ExcelWriter(
-                excel_buffer,
-                engine="openpyxl"
-            ) as writer:
-                comments_df.to_excel(
-                    writer,
-                    index=False,
-                    sheet_name="댓글 분석"
+                col3.metric(
+                    "댓글 수",
+                    f'{video_info["comment_count"]:,}'
                 )
 
-            excel_buffer.seek(0)
+                col4.metric(
+                    "업로드 날짜",
+                    video_info["published_at"] or "정보 없음"
+                )
 
-            st.download_button(
-                "댓글 분석 결과 엑셀 다운로드",
-                data=excel_buffer.getvalue(),
-                file_name="youtube_comments_analysis.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+                st.write(f'**채널:** {video_info["channel"]}')
+                st.write(f'**영상 ID:** {video_info["video_id"]}')
+                st.markdown(
+                    f'[영상 바로 보기]({video_info["url"]})'
+                )
 
-    # --------------------------------------
-    # 채널 인기 영상 TOP 5
-    # --------------------------------------
-    if selected.get("channel"):
-        st.header("🏆 채널 인기 영상 TOP 5")
+                description = video_info["description"]
 
-        if st.button("채널 인기 영상 불러오기"):
-            try:
-                with st.spinner("채널 영상을 확인하는 중..."):
-                    top_views, top_likes = get_channel_top_videos(
-                        youtube,
-                        info["채널 ID"]
+                with st.expander("영상 설명 보기"):
+                    if description:
+                        st.write(description)
+                    else:
+                        st.write("등록된 영상 설명이 없습니다.")
+
+                video_info_df = pd.DataFrame([{
+                    "영상 제목": video_info["title"],
+                    "채널": video_info["channel"],
+                    "업로드 날짜": video_info["published_at"],
+                    "조회수": video_info["views"],
+                    "좋아요": video_info["likes"],
+                    "댓글 수": video_info["comment_count"],
+                    "영상 링크": video_info["url"]
+                }])
+
+                st.download_button(
+                    "영상 정보 CSV 다운로드",
+                    data=video_info_df.to_csv(
+                        index=False
+                    ).encode("utf-8-sig"),
+                    file_name="youtube_video_info.csv",
+                    mime="text/csv"
+                )
+
+            # -------------------------------------------------
+            # 댓글 수집 및 감정 분석
+            # -------------------------------------------------
+
+            if feature_comments and youtube:
+                st.divider()
+                st.header("💬 댓글 수집 및 감정 분석")
+
+                try:
+                    with st.spinner("댓글을 수집하고 있습니다..."):
+                        comments = get_comments(
+                            youtube,
+                            video_id,
+                            limit=300
+                        )
+
+                    if not comments:
+                        st.warning(
+                            "수집 가능한 댓글이 없습니다. "
+                            "댓글 사용이 제한된 영상일 수 있습니다."
+                        )
+
+                    else:
+                        comments_df = pd.DataFrame(comments)
+
+                        st.write(
+                            f"수집한 댓글: **{len(comments_df):,}개**"
+                        )
+
+                        with st.spinner(
+                            "감정 분석 모델을 불러오고 댓글을 분석합니다..."
+                        ):
+                            analyzed_df = analyze_comments(comments_df)
+
+                        st.success("댓글 감정 분석이 완료되었습니다.")
+
+                        st.subheader("댓글 분석 결과")
+
+                        st.dataframe(
+                            analyzed_df,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        st.subheader("감정 분포")
+
+                        emotion_counts = (
+                            analyzed_df["감정"]
+                            .value_counts()
+                            .rename_axis("감정")
+                            .reset_index(name="댓글 수")
+                        )
+
+                        st.bar_chart(
+                            emotion_counts.set_index("감정")
+                        )
+
+                        st.dataframe(
+                            emotion_counts,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        st.download_button(
+                            "댓글 분석 결과 CSV 다운로드",
+                            data=analyzed_df.to_csv(
+                                index=False
+                            ).encode("utf-8-sig"),
+                            file_name="youtube_comments_analysis.csv",
+                            mime="text/csv"
+                        )
+
+                        # BytesIO를 사용해 엑셀 다운로드 오류를 방지한다.
+                        excel_data = make_excel_bytes(
+                            analyzed_df,
+                            sheet_name="댓글 분석"
+                        )
+
+                        st.download_button(
+                            "댓글 분석 결과 엑셀 다운로드",
+                            data=excel_data,
+                            file_name="youtube_comments_analysis.xlsx",
+                            mime=(
+                                "application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet"
+                            )
+                        )
+
+                except Exception as error:
+                    st.error(
+                        "댓글 수집 또는 감정 분석 중 오류가 발생했습니다. "
+                        "댓글 사용 설정, API 할당량 및 앱 로그를 확인해 주세요."
                     )
+                    st.exception(error)
 
-                st.session_state["top_views"] = top_views
-                st.session_state["top_likes"] = top_likes
+            # -------------------------------------------------
+            # 채널 인기 영상 TOP 5
+            # -------------------------------------------------
 
-            except Exception as e:
-                st.error(f"채널 영상 조회 실패: {e}")
+            if feature_channel_top and video_info and youtube:
+                st.divider()
+                st.header("🏆 채널 인기 영상 TOP 5")
 
-        top_views = st.session_state.get("top_views")
-        top_likes = st.session_state.get("top_likes")
-
-        if top_views is not None:
-            st.subheader("조회수 TOP 5")
-            st.dataframe(
-                top_views,
-                use_container_width=True,
-                hide_index=True
-            )
-
-        if top_likes is not None:
-            st.subheader("좋아요 수 TOP 5")
-            st.dataframe(
-                top_likes,
-                use_container_width=True,
-                hide_index=True
-            )
-
-    # --------------------------------------
-    # 핵심 요약
-    # --------------------------------------
-    if selected.get("summary"):
-        st.header("📝 영상 핵심 요약")
-
-        st.write("분석할 영상의 음성 파일을 업로드해 주세요.")
-
-        st.caption(
-            "MP3 파일 준비하기: "
-            "[유튜브 링크로 MP3 만드는 링크](https://media.ytmp3.gg/ko/tool/)"
-        )
-
-        audio_file = st.file_uploader(
-            "음성 파일 업로드",
-            type=[
-                "mp3", "wav", "m4a", "aac",
-                "flac", "ogg", "wma", "mp4", "webm"
-            ],
-            help=(
-                "음성이 포함된 파일을 업로드하세요. "
-                "긴 파일은 처리 시간이 더 걸릴 수 있습니다."
-            )
-        )
-
-        if audio_file:
-            st.success(f"업로드 완료: {audio_file.name}")
-
-            if st.button("음성 분석 및 핵심 요약"):
                 try:
                     with st.spinner(
-                        "음성을 텍스트로 변환 중입니다. "
+                        "채널의 영상 정보를 불러오고 있습니다..."
+                    ):
+                        top_df = get_channel_top_videos(
+                            youtube,
+                            video_info["channel_id"],
+                            limit=5
+                        )
+
+                    if top_df.empty:
+                        st.warning("채널의 영상 목록을 찾지 못했습니다.")
+
+                    else:
+                        st.dataframe(
+                            top_df,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        st.subheader("조회수 비교")
+
+                        st.bar_chart(
+                            top_df.set_index("영상 제목")["조회수"]
+                        )
+
+                        st.download_button(
+                            "인기 영상 TOP 5 CSV 다운로드",
+                            data=top_df.to_csv(
+                                index=False
+                            ).encode("utf-8-sig"),
+                            file_name="channel_top5.csv",
+                            mime="text/csv"
+                        )
+
+                        top_excel_data = make_excel_bytes(
+                            top_df,
+                            sheet_name="인기 영상 TOP 5"
+                        )
+
+                        st.download_button(
+                            "인기 영상 TOP 5 엑셀 다운로드",
+                            data=top_excel_data,
+                            file_name="channel_top5.xlsx",
+                            mime=(
+                                "application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet"
+                            )
+                        )
+
+                except Exception as error:
+                    st.error("채널 인기 영상을 가져오지 못했습니다.")
+                    st.exception(error)
+
+            # -------------------------------------------------
+            # 영상 핵심 요약
+            # -------------------------------------------------
+
+            if feature_summary and audio_file is not None:
+                st.divider()
+                st.header("📝 영상 핵심 요약")
+
+                temp_audio_path = None
+
+                try:
+                    extension = os.path.splitext(
+                        audio_file.name
+                    )[1]
+
+                    if not extension:
+                        extension = ".audio"
+
+                    with tempfile.NamedTemporaryFile(
+                        delete=False,
+                        suffix=extension
+                    ) as temp_audio:
+                        temp_audio.write(audio_file.getvalue())
+                        temp_audio_path = temp_audio.name
+
+                    with st.spinner(
+                        "음성을 텍스트로 변환하고 있습니다. "
                         "파일 길이에 따라 시간이 걸릴 수 있습니다..."
                     ):
-                        transcript = transcribe_audio(audio_file)
+                        transcript = transcribe_audio(temp_audio_path)
 
-                    if not transcript:
+                    if not transcript.strip():
                         st.warning(
-                            "음성에서 텍스트를 인식하지 못했습니다."
+                            "음성을 인식하지 못했습니다. "
+                            "음성이 포함된 파일인지 확인해 주세요."
                         )
+
                     else:
                         with st.spinner(
-                            "핵심 내용을 요약하고 있습니다..."
+                            "영상의 핵심 내용을 요약하고 있습니다..."
                         ):
                             summary = summarize_text(transcript)
 
-                        st.session_state["summary_text"] = summary
+                        st.subheader("핵심 요약")
+                        st.markdown(summary)
 
-                except Exception as e:
-                    st.error(f"음성 분석 중 오류가 발생했습니다: {e}")
-                    st.info(
-                        "오디오 파일 형식과 requirements.txt의 "
-                        "라이브러리 버전을 확인해 주세요."
+                        st.download_button(
+                            "핵심 요약 TXT 다운로드",
+                            data=summary.encode("utf-8-sig"),
+                            file_name="youtube_video_summary.txt",
+                            mime="text/plain"
+                        )
+
+                except Exception as error:
+                    st.error(
+                        "음성 변환 또는 요약 중 오류가 발생했습니다. "
+                        "업로드한 파일 형식과 Streamlit Cloud 로그를 확인해 주세요."
                     )
+                    st.exception(error)
 
-        # 대본은 표시하지 않고 요약 결과만 표시합니다.
-        summary = st.session_state.get("summary_text")
+                finally:
+                    if (
+                        temp_audio_path
+                        and os.path.exists(temp_audio_path)
+                    ):
+                        os.remove(temp_audio_path)
 
-        if summary:
-            st.subheader("✨ 핵심 내용")
-            st.markdown(summary)
-
-            st.download_button(
-                "핵심 요약 TXT 다운로드",
-                data=summary,
-                file_name="youtube_summary.txt",
-                mime="text/plain"
-            )
+            st.divider()
+            st.success("선택한 분석 작업을 실행했습니다.")
