@@ -2,8 +2,8 @@
 streamlit
 google-api-python-client
 pandas
-wordcloud
 openpyxl
 transformers
 torch
-requests
+youtube-transcript-api
+sentencepiece
